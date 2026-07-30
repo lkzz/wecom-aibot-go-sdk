@@ -1,4 +1,4 @@
-module github.com/go-sphere/wecom-aibot-go-sdk
+module github.com/lkzz/wecom-aibot-go-sdk
 
 go 1.22
 
