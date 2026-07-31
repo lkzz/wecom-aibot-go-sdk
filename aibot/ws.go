@@ -79,7 +79,11 @@ type WsConnectionManager struct {
 	maxAuthFailureAttempts int
 	maxReplyQueueSize      int
 
+	// ws 由多个 goroutine 访问：读循环、心跳定时器、每个 reqID 的发送
+	// goroutine，以及重连定时器。必须通过 conn/setConn/closeConn 访问，
+	// 否则 "if m.ws != nil" 之后字段可能已被置空，直接 nil 解引用 panic。
 	ws            *websocket.Conn
+	connMu        sync.RWMutex
 	isManualClose bool
 
 	// writeMu 串行化对 ws 的写操作。gorilla/websocket 只允许一个并发写者，
@@ -182,6 +186,43 @@ func NewWsConnectionManager(
 	}
 }
 
+// conn 返回当前连接，可能为 nil
+func (m *WsConnectionManager) conn() *websocket.Conn {
+	m.connMu.RLock()
+	defer m.connMu.RUnlock()
+	return m.ws
+}
+
+// setConn 设置当前连接
+func (m *WsConnectionManager) setConn(ws *websocket.Conn) {
+	m.connMu.Lock()
+	m.ws = ws
+	m.connMu.Unlock()
+}
+
+// closeConn 关闭并清空当前连接
+func (m *WsConnectionManager) closeConn() {
+	m.connMu.Lock()
+	ws := m.ws
+	m.ws = nil
+	m.connMu.Unlock()
+	if ws != nil {
+		_ = ws.Close()
+	}
+}
+
+// clearConnIf 仅当 ws 仍是当前连接时清空它，返回是否清空成功。
+// 用于让陈旧的读循环（其连接已被重连替换）不影响新连接的状态。
+func (m *WsConnectionManager) clearConnIf(ws *websocket.Conn) bool {
+	m.connMu.Lock()
+	defer m.connMu.Unlock()
+	if m.ws != ws {
+		return false
+	}
+	m.ws = nil
+	return true
+}
+
 // SetCredentials 设置认证凭证
 func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthParams map[string]interface{}) {
 	m.botID = botID
@@ -200,10 +241,7 @@ func (m *WsConnectionManager) Connect() {
 	}
 
 	// 清理可能未完全关闭的旧连接
-	if m.ws != nil {
-		_ = m.ws.Close()
-		m.ws = nil
-	}
+	m.closeConn()
 
 	m.logger.Info("Connecting to WebSocket: " + m.wsURL + "...")
 
@@ -226,10 +264,10 @@ func (m *WsConnectionManager) connect() {
 		return
 	}
 
-	m.ws = ws
+	m.setConn(ws)
 	m.missedPongCount = 0
 	m.lastCloseWasAuthFailure = false
-	m.setupEventHandlers()
+	m.setupEventHandlers(ws)
 
 	// 连接建立后立即发送认证帧
 	m.sendAuth()
@@ -239,9 +277,13 @@ func (m *WsConnectionManager) connect() {
 	}
 }
 
-// setupEventHandlers 设置事件处理器
-func (m *WsConnectionManager) setupEventHandlers() {
-	if m.ws == nil {
+// setupEventHandlers 启动 ws 的读循环。
+//
+// 读循环持有自己的 conn 引用，不读取 m.ws：处理消息的过程本身可能清空 m.ws
+// （disconnected_event、读错误后的 handleClose），重连也会把 m.ws 换成新连接。
+// 任何一种情况下再从字段取连接都会拿到 nil 或别人的连接。
+func (m *WsConnectionManager) setupEventHandlers(ws *websocket.Conn) {
+	if ws == nil {
 		return
 	}
 
@@ -254,14 +296,19 @@ func (m *WsConnectionManager) setupEventHandlers() {
 			default:
 			}
 
-			_, data, err := m.ws.ReadMessage()
+			_, data, err := ws.ReadMessage()
 			if err != nil {
 				if m.isManualClose {
 					return
 				}
 
 				m.logger.Error("WebSocket read error: " + err.Error())
-				m.handleClose(err.Error())
+				m.handleClose(ws, err.Error())
+				return
+			}
+
+			// 连接已被替换或关闭，本读循环已陈旧，停止处理
+			if m.conn() != ws {
 				return
 			}
 
@@ -311,10 +358,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 				m.OnServerDisconnect("New connection established, server disconnected this connection")
 			}
 			// 主动关闭 socket
-			if m.ws != nil {
-				_ = m.ws.Close()
-				m.ws = nil
-			}
+			m.closeConn()
 			return
 		}
 
@@ -378,9 +422,9 @@ func (m *WsConnectionManager) handleAuthResponse(frame *WsFrame) {
 		}
 		// 标记为认证失败，close 事件中 scheduleReconnect 会据此使用 authFailureAttempts 计数器
 		m.lastCloseWasAuthFailure = true
-		// 认证失败，主动关闭连接，触发 close → handleClose → scheduleReconnect
-		if m.ws != nil {
-			_ = m.ws.Close()
+		// 认证失败，主动关闭连接，触发读错误 → handleClose → scheduleReconnect
+		if ws := m.conn(); ws != nil {
+			_ = ws.Close()
 		}
 		return
 	}
@@ -405,13 +449,17 @@ func (m *WsConnectionManager) handleHeartbeatResponse(frame *WsFrame) {
 	m.missedPongCount = 0
 }
 
-// handleClose 处理连接关闭
-func (m *WsConnectionManager) handleClose(reason string) {
+// handleClose 处理连接关闭。ws 为发生关闭的那个连接，若它已不是当前连接，
+// 说明重连已经完成，本次关闭是陈旧事件，不应清理新连接或再次触发重连。
+func (m *WsConnectionManager) handleClose(ws *websocket.Conn, reason string) {
+	if !m.clearConnIf(ws) {
+		return
+	}
+	// 读循环已退出，关闭底层连接释放资源
+	_ = ws.Close()
+
 	m.stopHeartbeat()
 	m.clearPendingMessages("WebSocket connection closed (" + reason + ")")
-
-	// 释放旧 WebSocket 实例引用
-	m.ws = nil
 
 	if m.OnDisconnected != nil {
 		m.OnDisconnected(reason)
@@ -424,7 +472,7 @@ func (m *WsConnectionManager) handleClose(reason string) {
 
 // sendAuth 发送认证帧
 func (m *WsConnectionManager) sendAuth() {
-	if m.ws == nil {
+	if m.conn() == nil {
 		return
 	}
 
@@ -462,8 +510,8 @@ func (m *WsConnectionManager) sendHeartbeat() {
 	if m.missedPongCount >= maxMissedPong {
 		m.logger.Warn(fmt.Sprintf("No heartbeat ack received for %d consecutive pings, connection considered dead", m.missedPongCount))
 		m.stopHeartbeat()
-		if m.ws != nil {
-			_ = m.ws.Close()
+		if ws := m.conn(); ws != nil {
+			_ = ws.Close()
 		}
 		return
 	}
@@ -575,7 +623,8 @@ func (m *WsConnectionManager) scheduleReconnect() {
 
 // sendFrame 发送帧
 func (m *WsConnectionManager) sendFrame(frame WsFrame) {
-	if m.ws == nil {
+	ws := m.conn()
+	if ws == nil {
 		return
 	}
 
@@ -586,7 +635,7 @@ func (m *WsConnectionManager) sendFrame(frame WsFrame) {
 	}
 
 	m.writeMu.Lock()
-	err = m.ws.WriteMessage(websocket.TextMessage, data)
+	err = ws.WriteMessage(websocket.TextMessage, data)
 	m.writeMu.Unlock()
 	if err != nil {
 		m.logger.Error("Failed to send frame: " + err.Error())
@@ -595,7 +644,8 @@ func (m *WsConnectionManager) sendFrame(frame WsFrame) {
 
 // Send 发送数据帧
 func (m *WsConnectionManager) Send(frame WsFrame) error {
-	if m.ws == nil {
+	ws := m.conn()
+	if ws == nil {
 		return fmt.Errorf("WebSocket not connected, unable to send data")
 	}
 
@@ -606,7 +656,7 @@ func (m *WsConnectionManager) Send(frame WsFrame) error {
 
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
-	return m.ws.WriteMessage(websocket.TextMessage, data)
+	return ws.WriteMessage(websocket.TextMessage, data)
 }
 
 // SendReply 通过 WebSocket 通道发送回复消息
@@ -866,15 +916,12 @@ func (m *WsConnectionManager) Disconnect() {
 		m.reconnectTimer = nil
 	}
 
-	if m.ws != nil {
-		_ = m.ws.Close()
-		m.ws = nil
-	}
+	m.closeConn()
 
 	m.logger.Info("WebSocket connection manually closed")
 }
 
 // IsConnected 获取当前连接状态
 func (m *WsConnectionManager) IsConnected() bool {
-	return m.ws != nil
+	return m.conn() != nil
 }
