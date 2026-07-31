@@ -50,7 +50,7 @@ func TestConcurrentSendDoesNotPanic(t *testing.T) {
 		NewLoggerFunc(func(string, string, ...interface{}) {}),
 		0, 0, 0, "", nil, 0, 0,
 	)
-	m.ws = dialTestConn(t)
+	m.setConn(dialTestConn(t))
 
 	const (
 		writers = 8
