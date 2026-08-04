@@ -730,12 +730,29 @@ func buildMediaMsgBody(mediaType WeComMediaType, mediaID string, videoOptions *V
 // 文件操作
 // ============================================================================
 
-// DownloadFile 下载文件并使用 AES 密钥解密
+// DownloadFile 下载文件并使用 AES 密钥解密，不限制大小。
+//
+// 企业微信不在消息体里给出附件大小，文件有多大只有下载完才知道。对内存占用敏感
+// 的调用方应改用 DownloadFileLimited。
 func (c *WSClient) DownloadFile(fileURL, aesKey string) ([]byte, string, error) {
+	return c.DownloadFileLimited(fileURL, aesKey, 0)
+}
+
+// DownloadFileLimited 下载并解密文件，把读入内存的明文限制在 maxBytes 以内；
+// maxBytes <= 0 表示不限制。超限时返回包装了 ErrFileTooLarge 的错误，且不会把
+// 整个响应体读进内存。
+func (c *WSClient) DownloadFileLimited(fileURL, aesKey string, maxBytes int64) ([]byte, string, error) {
 	c.logger.Info("Downloading and decrypting file...")
 
+	// 密文按 32 字节块填充，最多比明文长 aesPaddingSlack。上界放宽这么多，才不会
+	// 把大小恰好贴着上限的合法文件误判为超限。
+	downloadLimit := maxBytes
+	if downloadLimit > 0 {
+		downloadLimit += aesPaddingSlack
+	}
+
 	// 下载加密的文件数据
-	result, err := c.apiClient.DownloadFileRaw(fileURL)
+	result, err := c.apiClient.DownloadFileRawLimited(fileURL, downloadLimit)
 	if err != nil {
 		c.logger.Error("File download failed: " + err.Error())
 		return nil, "", err

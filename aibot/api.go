@@ -1,6 +1,8 @@
 package aibot
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -9,6 +11,14 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrFileTooLarge 表示文件超出调用方给定的大小上限。调用方可用 errors.Is 判断，
+// 以便把"文件太大"与网络失败区分开来告知用户。
+var ErrFileTooLarge = errors.New("wecom: file exceeds size limit")
+
+// aesPaddingSlack 是 AES-256-CBC + PKCS#7 填充可能带来的最大额外字节数
+// （DecryptFile 按 32 字节块处理），密文因此最多比明文长这么多。
+const aesPaddingSlack = 32
 
 // FileResult 文件下载结果
 type FileResult struct {
@@ -39,8 +49,18 @@ func NewWeComApiClient(logger Logger, timeout int) *WeComApiClient {
 	}
 }
 
-// DownloadFileRaw 下载文件（返回原始数据及文件名）
+// DownloadFileRaw 下载文件（返回原始数据及文件名），不限制大小。
+//
+// 企业微信不在消息体里给出附件大小，因此响应体有多大只有读完才知道。若调用方
+// 对内存占用敏感，应改用 DownloadFileRawLimited。
 func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
+	return c.DownloadFileRawLimited(fileURL, 0)
+}
+
+// DownloadFileRawLimited 下载文件，并把读入内存的字节数限制在 maxBytes 以内；
+// maxBytes <= 0 表示不限制。超限时返回包装了 ErrFileTooLarge 的错误，且不会把
+// 整个响应体读进内存。
+func (c *WeComApiClient) DownloadFileRawLimited(fileURL string, maxBytes int64) (*FileResult, error) {
 	c.logger.Info("Downloading file...")
 
 	resp, err := c.httpClient.Get(fileURL)
@@ -56,11 +76,12 @@ func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		c.logger.Error("File download failed, status: " + resp.Status)
-		return nil, err
+		// 此处 err 必为 nil，必须自行构造错误：否则调用方会拿到 (nil, nil)，
+		// 随后解引用 FileResult 时 panic。
+		return nil, fmt.Errorf("wecom: file download failed with status %s", resp.Status)
 	}
 
-	// 读取响应体
-	body, err := io.ReadAll(resp.Body)
+	body, err := readAtMost(resp.Body, maxBytes)
 	if err != nil {
 		c.logger.Error("Failed to read response body: " + err.Error())
 		return nil, err
@@ -75,6 +96,25 @@ func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 		Buffer:   body,
 		Filename: filename,
 	}, nil
+}
+
+// readAtMost 最多读取 maxBytes 字节；maxBytes <= 0 表示不限制。
+//
+// 多读 1 字节用于判断是否超限：读满 maxBytes 本身是合法的，只有还能再读出内容
+// 才说明确实超了。Content-Length 仅用于提前失败，它可以缺失（分块传输）或造假，
+// 因此不能作为唯一依据。
+func readAtMost(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return io.ReadAll(body)
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("wecom: file exceeds %d bytes: %w", maxBytes, ErrFileTooLarge)
+	}
+	return data, nil
 }
 
 // parseFilename 从 Content-Disposition 头解析文件名
