@@ -417,9 +417,11 @@ type UploadMediaFinishBody struct {
 
 // UploadMediaFinishResult 完成上传响应 body
 type UploadMediaFinishResult struct {
-	Type      WeComMediaType `json:"type"`
-	MediaID   string         `json:"media_id"`
-	CreatedAt string         `json:"created_at"`
+	Type    WeComMediaType `json:"type"`
+	MediaID string         `json:"media_id"`
+	// CreatedAt 是 Unix 时间戳数字，与 EventMessage.CreateTime 一致。曾被声明为
+	// string，导致完成上传的响应解析失败、media_id 拿不到，整个媒体消息发不出去。
+	CreatedAt int64 `json:"created_at"`
 }
 
 // ============================================================================
