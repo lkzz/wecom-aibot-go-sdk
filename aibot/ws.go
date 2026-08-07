@@ -82,9 +82,12 @@ type WsConnectionManager struct {
 	// ws 由多个 goroutine 访问：读循环、心跳定时器、每个 reqID 的发送
 	// goroutine，以及重连定时器。必须通过 conn/setConn/closeConn 访问，
 	// 否则 "if m.ws != nil" 之后字段可能已被置空，直接 nil 解引用 panic。
-	ws            *websocket.Conn
-	connMu        sync.RWMutex
-	isManualClose bool
+	ws     *websocket.Conn
+	connMu sync.RWMutex
+
+	// isManualClose 写自调用方的 Connect/Disconnect，读自读循环、handleClose
+	// 和重连定时器，因此不能是裸 bool。
+	isManualClose atomic.Bool
 
 	// writeMu 串行化对 ws 的写操作。gorilla/websocket 只允许一个并发写者，
 	// 否则直接 panic("concurrent write to websocket connection")。本管理器有
@@ -103,7 +106,10 @@ type WsConnectionManager struct {
 	lastCloseWasAuthFailure bool
 	missedPongCount         int
 
-	// 定时器
+	// 定时器。两者都由多方访问：调用方的 Connect/Disconnect、读循环（经
+	// handleClose → scheduleReconnect）、以及定时器自己的回调，因此统一由
+	// timerMu 保护，只能通过下面的 setter/clear 方法访问。
+	timerMu        sync.Mutex
 	heartbeatTimer *time.Timer
 	reconnectTimer *time.Timer
 
@@ -223,6 +229,35 @@ func (m *WsConnectionManager) clearConnIf(ws *websocket.Conn) bool {
 	return true
 }
 
+// setReconnectTimer 替换挂起的重连定时器。
+func (m *WsConnectionManager) setReconnectTimer(t *time.Timer) {
+	m.timerMu.Lock()
+	old := m.reconnectTimer
+	m.reconnectTimer = t
+	m.timerMu.Unlock()
+	if old != nil {
+		old.Stop()
+	}
+}
+
+// stopReconnectTimer 取消并清空挂起的重连定时器。
+func (m *WsConnectionManager) stopReconnectTimer() {
+	m.timerMu.Lock()
+	t := m.reconnectTimer
+	m.reconnectTimer = nil
+	m.timerMu.Unlock()
+	if t != nil {
+		t.Stop()
+	}
+}
+
+// clearReconnectTimer 仅清空引用，不 Stop：由定时器回调自己调用，此时它已触发。
+func (m *WsConnectionManager) clearReconnectTimer() {
+	m.timerMu.Lock()
+	m.reconnectTimer = nil
+	m.timerMu.Unlock()
+}
+
 // SetCredentials 设置认证凭证
 func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthParams map[string]interface{}) {
 	m.botID = botID
@@ -232,13 +267,10 @@ func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthP
 
 // Connect 建立 WebSocket 连接
 func (m *WsConnectionManager) Connect() {
-	m.isManualClose = false
+	m.isManualClose.Store(false)
 
 	// 取消挂起的重连定时器，防止与当前 connect 竞态
-	if m.reconnectTimer != nil {
-		m.reconnectTimer.Stop()
-		m.reconnectTimer = nil
-	}
+	m.stopReconnectTimer()
 
 	// 清理可能未完全关闭的旧连接
 	m.closeConn()
@@ -298,7 +330,7 @@ func (m *WsConnectionManager) setupEventHandlers(ws *websocket.Conn) {
 
 			_, data, err := ws.ReadMessage()
 			if err != nil {
-				if m.isManualClose {
+				if m.isManualClose.Load() {
 					return
 				}
 
@@ -352,7 +384,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 			m.stopHeartbeat()
 			m.clearPendingMessages("Server disconnected due to new connection")
 			// 标记为非手动断开但阻止自动重连（服务端正常行为，重连也会被再次断开）
-			m.isManualClose = true
+			m.isManualClose.Store(true)
 			// 通知上层服务端主动断开
 			if m.OnServerDisconnect != nil {
 				m.OnServerDisconnect("New connection established, server disconnected this connection")
@@ -465,7 +497,7 @@ func (m *WsConnectionManager) handleClose(ws *websocket.Conn, reason string) {
 		m.OnDisconnected(reason)
 	}
 
-	if !m.isManualClose {
+	if !m.isManualClose.Load() {
 		m.scheduleReconnect()
 	}
 }
@@ -532,19 +564,24 @@ func (m *WsConnectionManager) sendHeartbeat() {
 func (m *WsConnectionManager) startHeartbeat() {
 	m.stopHeartbeat()
 
+	m.timerMu.Lock()
 	m.heartbeatTimer = time.AfterFunc(
 		time.Duration(m.heartbeatInterval)*time.Millisecond,
 		m.sendHeartbeat,
 	)
+	m.timerMu.Unlock()
 
 	m.logger.Debug(fmt.Sprintf("Heartbeat timer started, interval: %dms", m.heartbeatInterval))
 }
 
 // stopHeartbeat 停止心跳
 func (m *WsConnectionManager) stopHeartbeat() {
-	if m.heartbeatTimer != nil {
-		m.heartbeatTimer.Stop()
-		m.heartbeatTimer = nil
+	m.timerMu.Lock()
+	t := m.heartbeatTimer
+	m.heartbeatTimer = nil
+	m.timerMu.Unlock()
+	if t != nil {
+		t.Stop()
 	}
 }
 
@@ -577,16 +614,16 @@ func (m *WsConnectionManager) scheduleReconnect() {
 			m.OnReconnecting(m.authFailureAttempts)
 		}
 
-		m.reconnectTimer = time.AfterFunc(
+		m.setReconnectTimer(time.AfterFunc(
 			time.Duration(delay)*time.Millisecond,
 			func() {
-				m.reconnectTimer = nil
-				if m.isManualClose {
+				m.clearReconnectTimer()
+				if m.isManualClose.Load() {
 					return
 				}
 				m.Connect()
 			},
-		)
+		))
 	} else {
 		// 连接断开场景（网络异常、心跳超时等）
 		if m.maxReconnectAttempts > 0 && m.reconnectAttempts >= m.maxReconnectAttempts {
@@ -608,16 +645,16 @@ func (m *WsConnectionManager) scheduleReconnect() {
 			m.OnReconnecting(m.reconnectAttempts)
 		}
 
-		m.reconnectTimer = time.AfterFunc(
+		m.setReconnectTimer(time.AfterFunc(
 			time.Duration(delay)*time.Millisecond,
 			func() {
-				m.reconnectTimer = nil
-				if m.isManualClose {
+				m.clearReconnectTimer()
+				if m.isManualClose.Load() {
 					return
 				}
 				m.Connect()
 			},
-		)
+		))
 	}
 }
 
@@ -904,17 +941,14 @@ func (m *WsConnectionManager) clearPendingMessages(reason string) {
 
 // Disconnect 断开连接
 func (m *WsConnectionManager) Disconnect() {
-	m.isManualClose = true
+	m.isManualClose.Store(true)
 	m.cancel()
 
 	m.stopHeartbeat()
 	m.clearPendingMessages("Connection manually closed")
 
 	// 取消挂起的重连定时器
-	if m.reconnectTimer != nil {
-		m.reconnectTimer.Stop()
-		m.reconnectTimer = nil
-	}
+	m.stopReconnectTimer()
 
 	m.closeConn()
 
