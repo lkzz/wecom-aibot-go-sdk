@@ -29,6 +29,10 @@ const (
 	replyAckTimeout            = 5000 // 回执超时 (ms)
 	defaultMaxReplyQueueSize   = 500  // 单个 req_id 的默认最大队列长度
 	defaultMaxAuthFailAttempts = 5    // 默认认证失败最大重试次数
+
+	// dispatchQueueSize 应用层分发队列的缓冲长度。取值只需覆盖「上层处理一帧的
+	// 耗时内企业微信推来多少帧」，缓冲满时丢帧而非阻塞，见 enqueueDispatch。
+	dispatchQueueSize = 256
 )
 
 // ============================================================================
@@ -120,6 +124,11 @@ type WsConnectionManager struct {
 	pendingAcksMu sync.Mutex
 	pendingAckSeq uint64
 
+	// dispatchCh 把消息/事件帧交给分发 goroutine，使读循环不被上层回调阻塞。
+	// 只有一个消费者，因此帧的到达顺序被保留：上层常按到达先后关联同一次用户
+	// 操作拆出的多条消息，一帧一 goroutine 会破坏这个前提。
+	dispatchCh chan *WsFrame
+
 	// 回调函数
 	OnConnected        OnConnectedFunc
 	OnAuthenticated    OnAuthenticatedFunc
@@ -174,7 +183,7 @@ func NewWsConnectionManager(
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &WsConnectionManager{
+	m := &WsConnectionManager{
 		logger:                 logger,
 		wsURL:                  wsURL,
 		dialer:                 dialer,
@@ -186,9 +195,58 @@ func NewWsConnectionManager(
 
 		replyQueues: make(map[string][]replyQueueItem),
 		pendingAcks: make(map[string]*pendingAck),
+		dispatchCh:  make(chan *WsFrame, dispatchQueueSize),
 
 		ctx:    ctx,
 		cancel: cancel,
+	}
+
+	// 分发 goroutine 的生命周期跟随管理器而非单个连接：重连会重建读循环，
+	// 在读循环里启动会导致每次重连多出一个消费者，帧将在多个消费者间乱序。
+	go m.dispatchLoop()
+
+	return m
+}
+
+// dispatchLoop 串行地把帧交给上层回调，直到管理器被 Disconnect 关闭。
+//
+// 上层回调可能阻塞数秒（发送回复要等企业微信回执），这里逐帧同步调用是有意的：
+// 顺序被保留，而读循环不受影响。回调自身的耗时由上层决定是否再让出。
+func (m *WsConnectionManager) dispatchLoop() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case frame := <-m.dispatchCh:
+			m.dispatch(frame)
+		}
+	}
+}
+
+// dispatch 调用 OnMessage 并兜住 panic。回调由使用方提供，一次 panic 不应该
+// 连带杀掉分发 goroutine，否则该连接后续所有帧都不再送达。
+func (m *WsConnectionManager) dispatch(frame *WsFrame) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error(fmt.Sprintf("Panic in OnMessage handler: %v", r))
+		}
+	}()
+
+	if m.OnMessage != nil {
+		m.OnMessage(frame)
+	}
+}
+
+// enqueueDispatch 把帧交给分发 goroutine。
+//
+// 队列满时丢弃并告警，而不是阻塞：阻塞会把读循环重新拖进等待，而回执只能由读
+// 循环自己投递，等待的回调将永远等不到它需要的那一帧。
+func (m *WsConnectionManager) enqueueDispatch(frame *WsFrame) {
+	select {
+	case m.dispatchCh <- frame:
+	default:
+		m.logger.Warn(fmt.Sprintf("Dispatch queue full (%d), dropping frame: cmd=%s, reqId=%s",
+			dispatchQueueSize, frame.Cmd, frame.Headers.ReqID))
 	}
 }
 
@@ -363,9 +421,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 	// 消息推送回调
 	if cmd == WsCmd.CALLBACK {
 		m.logger.Debug(fmt.Sprintf("[server -> plugin] cmd=%s, reqId=%s", cmd, reqID))
-		if m.OnMessage != nil {
-			m.OnMessage(&frame)
-		}
+		m.enqueueDispatch(&frame)
 		return
 	}
 
@@ -376,10 +432,10 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 		// 检测 disconnected_event：有新连接建立，服务端通知旧连接即将被断开
 		if m.isDisconnectedEvent(&frame) {
 			m.logger.Warn("Received disconnected_event: a new connection has been established, this connection will be closed by server")
-			// 先分发事件给上层（让用户可以监听 disconnected_event）
-			if m.OnMessage != nil {
-				m.OnMessage(&frame)
-			}
+			// 先分发事件给上层（让用户可以监听 disconnected_event）。
+			// 下面的清理不等待分发完成：连接即将被服务端关闭，回执已无从投递，
+			// 拖住读循环只会延后清理。
+			m.enqueueDispatch(&frame)
 			// 停止心跳、清理待处理消息
 			m.stopHeartbeat()
 			m.clearPendingMessages("Server disconnected due to new connection")
@@ -394,13 +450,13 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 			return
 		}
 
-		if m.OnMessage != nil {
-			m.OnMessage(&frame)
-		}
+		m.enqueueDispatch(&frame)
 		return
 	}
 
-	// 无 cmd 的帧：认证响应、心跳响应或回复消息回执
+	// 无 cmd 的帧：认证响应、心跳响应或回复消息回执。
+	// 这三类都在读循环内就地处理，不进分发队列：回执必须能在上层回调等待期间
+	// 送达，这正是分发被移出读循环的原因。
 
 	// 认证响应（优先于 pendingAcks 检查，避免误判）
 	if strings.HasPrefix(reqID, WsCmd.SUBSCRIBE) {
@@ -942,6 +998,7 @@ func (m *WsConnectionManager) clearPendingMessages(reason string) {
 // Disconnect 断开连接
 func (m *WsConnectionManager) Disconnect() {
 	m.isManualClose.Store(true)
+	// cancel 同时终止读循环与分发 goroutine
 	m.cancel()
 
 	m.stopHeartbeat()
