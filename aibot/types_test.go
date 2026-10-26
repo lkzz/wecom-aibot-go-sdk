@@ -5,43 +5,52 @@ import (
 	"testing"
 )
 
-// TestUploadMediaFinishResultParsesNumericCreatedAt 锁住企微完成上传响应里
-// created_at 是**数字**这一事实。
-//
-// 该 payload 取自真机：CreatedAt 曾被声明为 string，线上报
-// "cannot unmarshal number into Go struct field
-// UploadMediaFinishResult.created_at of type string"。这一个字段类型不符会让
-// json.Unmarshal 整体返回错误，调用方拿不到 media_id，媒体消息完全发不出去 ——
-// 即便 media_id 本身在报文里是好的。
-func TestUploadMediaFinishResultParsesNumericCreatedAt(t *testing.T) {
-	const payload = `{"type":"image","media_id":"MEDIA-ID-123","created_at":1785999999}`
-
-	var got UploadMediaFinishResult
-	if err := json.Unmarshal([]byte(payload), &got); err != nil {
-		t.Fatalf("解析完成上传响应失败: %v", err)
+func TestWeComTimestamp_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want WeComTimestamp
+	}{
+		{name: "numeric timestamp", json: `1767240000`, want: 1767240000},
+		{name: "string timestamp", json: `"1767240000"`, want: 1767240000},
+		{name: "zero numeric", json: `0`, want: 0},
+		{name: "null", json: `null`, want: 0},
+		{name: "empty string", json: `""`, want: 0},
 	}
-	if got.MediaID != "MEDIA-ID-123" {
-		t.Errorf("MediaID = %q, want %q", got.MediaID, "MEDIA-ID-123")
-	}
-	if got.Type != WeComMediaTypeImage {
-		t.Errorf("Type = %q, want %q", got.Type, WeComMediaTypeImage)
-	}
-	if got.CreatedAt != 1785999999 {
-		t.Errorf("CreatedAt = %d, want %d", got.CreatedAt, 1785999999)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got WeComTimestamp
+			if err := json.Unmarshal([]byte(tt.json), &got); err != nil {
+				t.Fatalf("json.Unmarshal(%s) failed: %v", tt.json, err)
+			}
+			if got != tt.want {
+				t.Fatalf("json.Unmarshal(%s) = %d, want %d", tt.json, int64(got), int64(tt.want))
+			}
+		})
 	}
 }
 
-// TestUploadMediaFinishResultToleratesAbsentCreatedAt 保证 created_at 缺失时仍能拿到
-// media_id：该字段无人读取，不该成为发送成功的前提。
-func TestUploadMediaFinishResultToleratesAbsentCreatedAt(t *testing.T) {
+func TestWeComTimestamp_UnmarshalJSON_Invalid(t *testing.T) {
+	invalid := []string{`"abc"`, `{}`, `true`, `12.5`}
+	for _, in := range invalid {
+		var got WeComTimestamp
+		if err := json.Unmarshal([]byte(in), &got); err == nil {
+			t.Fatalf("json.Unmarshal(%s) succeeded (%d), want error", in, int64(got))
+		}
+	}
+}
+
+func TestUploadMediaFinishResult_UnmarshalJSON(t *testing.T) {
+	// 企微返回 created_at 为数字时间戳（见 PR #1：原 string 字段导致解析失败）
+	raw := []byte(`{"type":"image","media_id":"MEDIA_ID_123","created_at":1767240000}`)
 	var got UploadMediaFinishResult
-	if err := json.Unmarshal([]byte(`{"type":"file","media_id":"M-1"}`), &got); err != nil {
-		t.Fatalf("解析缺少 created_at 的响应失败: %v", err)
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
 	}
-	if got.MediaID != "M-1" {
-		t.Errorf("MediaID = %q, want %q", got.MediaID, "M-1")
+	if got.MediaID != "MEDIA_ID_123" {
+		t.Errorf("MediaID = %q, want MEDIA_ID_123", got.MediaID)
 	}
-	if got.CreatedAt != 0 {
-		t.Errorf("CreatedAt = %d, want 0", got.CreatedAt)
+	if int64(got.CreatedAt) != 1767240000 {
+		t.Errorf("CreatedAt = %d, want 1767240000", int64(got.CreatedAt))
 	}
 }

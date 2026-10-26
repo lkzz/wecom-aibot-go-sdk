@@ -90,7 +90,7 @@ func TestHandlerCanAwaitReplyAck(t *testing.T) {
 
 	conn := dialAckingConn(t, `{"cmd":"aibot_event_callback","headers":{"req_id":"r1"},"body":{"msgtype":"event","event":{"eventtype":"enter_chat"}}}`)
 	m.setConn(conn)
-	m.setupEventHandlers(conn)
+	m.setupEventHandlers()
 
 	// Comfortably under replyAckTimeout (5000ms): the point is that the ack
 	// arrives on its own, not that it beats the deadline by a hair.
@@ -141,7 +141,7 @@ func TestDispatchPreservesFrameOrder(t *testing.T) {
 
 	conn := dialAckingConn(t, frames...)
 	m.setConn(conn)
-	m.setupEventHandlers(conn)
+	m.setupEventHandlers()
 
 	select {
 	case <-all:
@@ -180,7 +180,7 @@ func TestDispatchSurvivesHandlerPanic(t *testing.T) {
 		`{"cmd":"aibot_msg_callback","headers":{"req_id":"r2"},"body":{"msgtype":"text"}}`,
 	)
 	m.setConn(conn)
-	m.setupEventHandlers(conn)
+	m.setupEventHandlers()
 
 	select {
 	case reqID := <-second:
@@ -205,7 +205,7 @@ func TestReplyAckStillHandledOnReadLoop(t *testing.T) {
 
 	conn := dialAckingConn(t)
 	m.setConn(conn)
-	m.setupEventHandlers(conn)
+	m.setupEventHandlers()
 
 	if _, err := m.SendReply("r9", map[string]any{"msgtype": "text"}, WsCmd.RESPONSE); err != nil {
 		t.Fatalf("SendReply: %v", err)
