@@ -4,9 +4,9 @@ GOLANGCI_LINT ?= golangci-lint
 GO_MOD_DIRS := . examples/basic examples/agent
 DIRECT_DEPS_TEMPLATE := {{if and (not .Main) (not .Indirect) (not .Replace)}}{{.Path}}{{end}}
 
-# Resolve go-sphere modules straight from GitHub, bypassing the module proxy
+# Resolve lkzz modules straight from GitHub, bypassing the module proxy
 # and its cached "@latest", which lags behind freshly pushed tags.
-DIRECT_ORIGIN := GOPRIVATE=github.com/go-sphere/*
+DIRECT_ORIGIN := GOPRIVATE=github.com/lkzz/*
 
 .DEFAULT_GOAL := check
 

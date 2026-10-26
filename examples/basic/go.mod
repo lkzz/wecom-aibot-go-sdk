@@ -1,12 +1,12 @@
-module github.com/go-sphere/wecom-aibot-go-sdk/examples/basic
+module github.com/lkzz/wecom-aibot-go-sdk/examples/basic
 
 go 1.26.8
 
-replace github.com/go-sphere/wecom-aibot-go-sdk => ../..
+replace github.com/lkzz/wecom-aibot-go-sdk => ../..
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.74.0
-	github.com/go-sphere/wecom-aibot-go-sdk v0.0.0-20260325085413-090d8d7b0477
+	github.com/lkzz/wecom-aibot-go-sdk v0.0.0-20260325085413-090d8d7b0477
 )
 
 require (

@@ -13,7 +13,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/go-sphere/wecom-aibot-go-sdk/aibot"
+	"github.com/lkzz/wecom-aibot-go-sdk/aibot"
 )
 
 type Config struct {

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/go-sphere/wecom-aibot-go-sdk/aibot"
+	"github.com/lkzz/wecom-aibot-go-sdk/aibot"
 )
 
 // agentStreamState holds the mutable state shared between the agent loop
