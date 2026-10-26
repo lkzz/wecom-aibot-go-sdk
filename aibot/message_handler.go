@@ -10,11 +10,12 @@ import (
 
 // MessageHandler 消息处理器
 // 负责解析 WebSocket 帧并分发为具体的消息事件和事件回调
+// WSClient 内部使用；只有自行管理 WsConnectionManager 时才需要直接使用。无内部状态，可并发使用。
 type MessageHandler struct {
 	logger Logger
 }
 
-// NewMessageHandler 创建消息处理器
+// NewMessageHandler 创建消息处理器，logger 不能为 nil。
 func NewMessageHandler(logger Logger) *MessageHandler {
 	return &MessageHandler{
 		logger: logger,
@@ -26,10 +27,12 @@ func NewMessageHandler(logger Logger) *MessageHandler {
 //	WebSocket 推送帧结构：
 //	- 消息推送：{ cmd: "aibot_msg_callback", headers: { req_id: "xxx" }, body: { msgid, msgtype, ... } }
 //	- 事件推送：{ cmd: "aibot_event_callback", headers: { req_id: "xxx" }, body: { msgid, msgtype: "event", event: { ... } }
+//
+// frame.Cmd 为 WsCmd.EVENT_CALLBACK 时按事件分发（先 EmitEvent，再按 eventtype 调用对应方法），否则按消息分发（先 EmitMessage，再按 msgtype 调用对应方法）。无效帧、缺少 msgtype 或 eventtype 的帧只记录日志。emitter 中的 panic 会被恢复并记录日志。
 func (h *MessageHandler) HandleFrame(frame *WsFrame, emitter FrameEmitter) {
 	defer func() {
 		if r := recover(); r != nil {
-			h.logger.Error("Panic in HandleFrame: " + toString(r))
+			h.logger.Error("Panic in HandleFrame: %s", toString(r))
 		}
 	}()
 
@@ -41,7 +44,7 @@ func (h *MessageHandler) HandleFrame(frame *WsFrame, emitter FrameEmitter) {
 	// 解析 body 获取 msgtype
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Warn("Failed to parse message body: " + err.Error())
+		h.logger.Warn("Failed to parse message body: %s", err.Error())
 		return
 	}
 
@@ -66,7 +69,7 @@ func (h *MessageHandler) handleMessageCallback(frame *WsFrame, emitter FrameEmit
 	// 解析 body 获取具体消息类型
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Error("Failed to parse message body: " + err.Error())
+		h.logger.Error("Failed to parse message body: %s", err.Error())
 		return
 	}
 
@@ -90,7 +93,7 @@ func (h *MessageHandler) handleMessageCallback(frame *WsFrame, emitter FrameEmit
 	case string(MessageTypeVideo):
 		emitter.EmitMessageVideo(frame)
 	default:
-		h.logger.Debug("Received unhandled message type: " + msgtype)
+		h.logger.Debug("Received unhandled message type: %s", msgtype)
 	}
 }
 
@@ -99,7 +102,7 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 	// 解析 body
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Error("Failed to parse event body: " + err.Error())
+		h.logger.Error("Failed to parse event body: %s", err.Error())
 		return
 	}
 
@@ -117,7 +120,7 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 		eventMap = v
 	case string:
 		if err := json.Unmarshal([]byte(v), &eventMap); err != nil {
-			h.logger.Error("Failed to parse event JSON: " + err.Error())
+			h.logger.Error("Failed to parse event JSON: %s", err.Error())
 			return
 		}
 	default:
@@ -152,7 +155,7 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 	case string(EventTypeDisconnected):
 		emitter.EmitEventDisconnected(frame)
 	default:
-		h.logger.Debug("Received unhandled event type: " + eventType)
+		h.logger.Debug("Received unhandled event type: %s", eventType)
 	}
 }
 
@@ -173,6 +176,7 @@ func toString(v interface{}) string {
 // ============================================================================
 
 // FrameEmitter 帧事件发射器接口
+// MessageHandler.HandleFrame 通过它分发帧；WSClient 实现了该接口，将帧转发给已注册的回调。实现应能处理在读协程上被同步调用。
 type FrameEmitter interface {
 	// 通用消息事件
 	EmitMessage(frame *WsFrame)
@@ -197,17 +201,41 @@ type FrameEmitter interface {
 // ============================================================================
 
 // NoOpEmitter 空事件发射器（用于不需要事件分发的场景）
+// 所有方法都不做任何事，零值可用。
 type NoOpEmitter struct{}
 
-func (e *NoOpEmitter) EmitMessage(frame *WsFrame)                {}
-func (e *NoOpEmitter) EmitMessageText(frame *WsFrame)            {}
-func (e *NoOpEmitter) EmitMessageImage(frame *WsFrame)           {}
-func (e *NoOpEmitter) EmitMessageMixed(frame *WsFrame)           {}
-func (e *NoOpEmitter) EmitMessageVoice(frame *WsFrame)           {}
-func (e *NoOpEmitter) EmitMessageFile(frame *WsFrame)            {}
-func (e *NoOpEmitter) EmitMessageVideo(frame *WsFrame)           {}
-func (e *NoOpEmitter) EmitEvent(frame *WsFrame)                  {}
-func (e *NoOpEmitter) EmitEventEnterChat(frame *WsFrame)         {}
+// EmitMessage 空操作。
+func (e *NoOpEmitter) EmitMessage(frame *WsFrame) {}
+
+// EmitMessageText 空操作。
+func (e *NoOpEmitter) EmitMessageText(frame *WsFrame) {}
+
+// EmitMessageImage 空操作。
+func (e *NoOpEmitter) EmitMessageImage(frame *WsFrame) {}
+
+// EmitMessageMixed 空操作。
+func (e *NoOpEmitter) EmitMessageMixed(frame *WsFrame) {}
+
+// EmitMessageVoice 空操作。
+func (e *NoOpEmitter) EmitMessageVoice(frame *WsFrame) {}
+
+// EmitMessageFile 空操作。
+func (e *NoOpEmitter) EmitMessageFile(frame *WsFrame) {}
+
+// EmitMessageVideo 空操作。
+func (e *NoOpEmitter) EmitMessageVideo(frame *WsFrame) {}
+
+// EmitEvent 空操作。
+func (e *NoOpEmitter) EmitEvent(frame *WsFrame) {}
+
+// EmitEventEnterChat 空操作。
+func (e *NoOpEmitter) EmitEventEnterChat(frame *WsFrame) {}
+
+// EmitEventTemplateCardEvent 空操作。
 func (e *NoOpEmitter) EmitEventTemplateCardEvent(frame *WsFrame) {}
-func (e *NoOpEmitter) EmitEventFeedbackEvent(frame *WsFrame)     {}
-func (e *NoOpEmitter) EmitEventDisconnected(frame *WsFrame)      {}
+
+// EmitEventFeedbackEvent 空操作。
+func (e *NoOpEmitter) EmitEventFeedbackEvent(frame *WsFrame) {}
+
+// EmitEventDisconnected 空操作。
+func (e *NoOpEmitter) EmitEventDisconnected(frame *WsFrame) {}

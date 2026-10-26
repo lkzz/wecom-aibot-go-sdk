@@ -62,7 +62,7 @@ func TestReadLoopSurvivesDisconnectedEvent(t *testing.T) {
 
 	conn := dialPushConn(t, `{"cmd":"aibot_event_callback","headers":{"req_id":"r1"},"body":{"event":{"eventtype":"disconnected_event"}}}`)
 	m.setConn(conn)
-	m.setupEventHandlers(conn)
+	m.setupEventHandlers()
 
 	select {
 	case <-disconnected:

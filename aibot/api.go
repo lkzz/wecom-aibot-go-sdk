@@ -12,28 +12,28 @@ import (
 	"time"
 )
 
-// ErrFileTooLarge 表示文件超出调用方给定的大小上限。调用方可用 errors.Is 判断，
-// 以便把"文件太大"与网络失败区分开来告知用户。
+// ErrFileTooLarge reports that a download exceeded the caller's size limit; match it with errors.Is.
 var ErrFileTooLarge = errors.New("wecom: file exceeds size limit")
 
-// aesPaddingSlack 是 AES-256-CBC + PKCS#7 填充可能带来的最大额外字节数
-// （DecryptFile 按 32 字节块处理），密文因此最多比明文长这么多。
+// aesPaddingSlack is the max extra bytes AES-256-CBC PKCS#7 padding (32-byte blocks) adds to ciphertext.
 const aesPaddingSlack = 32
 
 // FileResult 文件下载结果
 type FileResult struct {
-	Buffer   []byte
-	Filename string
+	Buffer   []byte // 响应体原始数据（未解密）
+	Filename string // 从 Content-Disposition 解析出的文件名，可能为空
 }
 
 // WeComApiClient 企业微信 API 客户端
 // 仅负责文件下载等 HTTP 辅助功能，消息收发均走 WebSocket 通道
+// 可并发使用。通常通过 WSClient.GetAPI 获取。
 type WeComApiClient struct {
 	httpClient *http.Client
 	logger     Logger
 }
 
 // NewWeComApiClient 创建 API 客户端
+// timeout 为 HTTP 请求超时（毫秒），<= 0 时使用 10000；logger 不能为 nil。
 func NewWeComApiClient(logger Logger, timeout int) *WeComApiClient {
 	if timeout <= 0 {
 		timeout = 10000
@@ -49,41 +49,39 @@ func NewWeComApiClient(logger Logger, timeout int) *WeComApiClient {
 	}
 }
 
-// DownloadFileRaw 下载文件（返回原始数据及文件名），不限制大小。
+// DownloadFileRaw 下载文件（返回原始数据及文件名）
 //
-// 企业微信不在消息体里给出附件大小，因此响应体有多大只有读完才知道。若调用方
-// 对内存占用敏感，应改用 DownloadFileRawLimited。
+// 对 fileURL 发起 HTTP GET，不解密。请求失败、响应状态不是 200 或读取响应体失败时返回错误；成功时返回完整读入内存的响应体。加密文件可再用 DecryptFile 解密，或直接使用 WSClient.DownloadFile。
 func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 	return c.DownloadFileRawLimited(fileURL, 0)
 }
 
-// DownloadFileRawLimited 下载文件，并把读入内存的字节数限制在 maxBytes 以内；
-// maxBytes <= 0 表示不限制。超限时返回包装了 ErrFileTooLarge 的错误，且不会把
-// 整个响应体读进内存。
+// DownloadFileRawLimited is DownloadFileRaw with the body capped at maxBytes (<= 0 means unlimited).
+// Exceeding the cap returns an error wrapping ErrFileTooLarge without buffering the whole body.
 func (c *WeComApiClient) DownloadFileRawLimited(fileURL string, maxBytes int64) (*FileResult, error) {
 	c.logger.Info("Downloading file...")
 
 	resp, err := c.httpClient.Get(fileURL)
 	if err != nil {
-		c.logger.Error("File download failed: " + err.Error())
+		c.logger.Error("File download failed: %s", err.Error())
 		return nil, err
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			c.logger.Error("Failed to close response body: " + err.Error())
+			c.logger.Error("Failed to close response body: %s", err.Error())
 		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		c.logger.Error("File download failed, status: " + resp.Status)
-		// 此处 err 必为 nil，必须自行构造错误：否则调用方会拿到 (nil, nil)，
-		// 随后解引用 FileResult 时 panic。
-		return nil, fmt.Errorf("wecom: file download failed with status %s", resp.Status)
+		c.logger.Error("File download failed, status: %s", resp.Status)
+		// 排空响应体以便复用底层连接，并返回明确错误而非 (nil, nil)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("file download failed with status %s", resp.Status)
 	}
 
 	body, err := readAtMost(resp.Body, maxBytes)
 	if err != nil {
-		c.logger.Error("Failed to read response body: " + err.Error())
+		c.logger.Error("Failed to read response body: %s", err.Error())
 		return nil, err
 	}
 
@@ -98,11 +96,8 @@ func (c *WeComApiClient) DownloadFileRawLimited(fileURL string, maxBytes int64) 
 	}, nil
 }
 
-// readAtMost 最多读取 maxBytes 字节；maxBytes <= 0 表示不限制。
-//
-// 多读 1 字节用于判断是否超限：读满 maxBytes 本身是合法的，只有还能再读出内容
-// 才说明确实超了。Content-Length 仅用于提前失败，它可以缺失（分块传输）或造假，
-// 因此不能作为唯一依据。
+// readAtMost reads up to maxBytes (<= 0 means unlimited); one extra byte is read to detect overflow
+// since Content-Length may be absent (chunked) or wrong.
 func readAtMost(body io.Reader, maxBytes int64) ([]byte, error) {
 	if maxBytes <= 0 {
 		return io.ReadAll(body)
@@ -160,6 +155,7 @@ func parseFilename(contentDisposition string) string {
 }
 
 // GetFilenameFromURL 从 URL 解析文件名
+// 优先取路径的最后一段并做 URL 解码；URL 无法解析时返回空字符串。
 func GetFilenameFromURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -198,6 +194,7 @@ func GetFilenameFromURL(rawURL string) string {
 }
 
 // GetMimeType 获取文件的 MIME 类型
+// 按扩展名通过 mime.TypeByExtension 查询，未知扩展名返回空字符串。
 func GetMimeType(filename string) string {
 	ext := filepath.Ext(filename)
 	return mime.TypeByExtension(ext)
